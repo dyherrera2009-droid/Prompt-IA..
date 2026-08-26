@@ -24,13 +24,21 @@ Para correrlo:
     streamlit run prompt_ia_prototipo.py
 """
 
+import hashlib
+import json
 import os
 import random
+import secrets
 import streamlit as st
 import streamlit.components.v1 as components
 from datetime import datetime
 from dotenv import load_dotenv
 from groq import Groq
+
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
 
 load_dotenv()
 
@@ -82,6 +90,189 @@ TIPOS_TAREA = {
 }
 OPCIONES_MODELO = list(TIPOS_TAREA.values())
 DIAS_INACTIVIDAD_LIMITE = 14
+LIMITE_DIARIO_LIBRE = 10
+
+# ---------------------------------------------------------------------
+# Base de datos (Supabase / Postgres): cuentas de usuario, historial
+# persistente, y limite diario del plan gratis. Se conecta via la cadena
+# guardada en st.secrets["SUPABASE_DB_URL"] (nunca hardcodeada en el
+# codigo). Si el secret no esta configurado, la app sigue funcionando en
+# modo "solo plan gratis, sin cuentas" (igual que antes).
+# ---------------------------------------------------------------------
+def _cadena_conexion_db():
+    try:
+        return st.secrets["SUPABASE_DB_URL"]
+    except Exception:
+        return None
+
+
+DB_DISPONIBLE = psycopg2 is not None and _cadena_conexion_db() is not None
+_DB_INICIALIZADA = False
+
+
+def _ejecutar(consulta, parametros=None, fetch=False, fetchone=False):
+    conn = psycopg2.connect(_cadena_conexion_db())
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(consulta, parametros or ())
+                if fetchone:
+                    return cur.fetchone()
+                if fetch:
+                    return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def inicializar_db():
+    global _DB_INICIALIZADA
+    if _DB_INICIALIZADA or not DB_DISPONIBLE:
+        return
+    _ejecutar("""
+        CREATE TABLE IF NOT EXISTS usuarios (
+            id SERIAL PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            creado TEXT NOT NULL
+        )
+    """)
+    _ejecutar("""
+        CREATE TABLE IF NOT EXISTS historial (
+            id SERIAL PRIMARY KEY,
+            usuario_id INTEGER NOT NULL REFERENCES usuarios(id),
+            tipo TEXT,
+            resultado TEXT,
+            fecha TEXT,
+            texto TEXT,
+            modelo_usado TEXT,
+            explicacion TEXT,
+            respuesta_tarea TEXT,
+            mensajes_extra TEXT
+        )
+    """)
+    _ejecutar("""
+        CREATE TABLE IF NOT EXISTS uso_libre (
+            uid TEXT NOT NULL,
+            fecha TEXT NOT NULL,
+            conteo INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (uid, fecha)
+        )
+    """)
+    _DB_INICIALIZADA = True
+
+
+def _hash_password(password, salt=None):
+    if salt is None:
+        salt = secrets.token_hex(16)
+    derivado = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), bytes.fromhex(salt), 100_000
+    )
+    return derivado.hex(), salt
+
+
+def crear_usuario(email: str, password: str):
+    email = email.strip().lower()
+    if not email or "@" not in email:
+        return False, "Escribe un correo valido."
+    if len(password) < 6:
+        return False, "La contraseña debe tener al menos 6 caracteres."
+    existente = _ejecutar("SELECT id FROM usuarios WHERE email = %s", (email,), fetchone=True)
+    if existente:
+        return False, "Ya existe una cuenta con ese correo."
+    hash_hex, salt = _hash_password(password)
+    _ejecutar(
+        "INSERT INTO usuarios (email, password_hash, salt, creado) VALUES (%s, %s, %s, %s)",
+        (email, hash_hex, salt, datetime.now().isoformat()),
+    )
+    return True, "Cuenta creada. Ahora inicia sesion."
+
+
+def verificar_usuario(email: str, password: str):
+    email = email.strip().lower()
+    fila = _ejecutar(
+        "SELECT id, email, password_hash, salt FROM usuarios WHERE email = %s",
+        (email,), fetchone=True,
+    )
+    if fila is None:
+        return None
+    id_usuario, email_db, hash_guardado, salt = fila
+    hash_hex, _ = _hash_password(password, salt)
+    if hash_hex == hash_guardado:
+        return {"id": id_usuario, "email": email_db}
+    return None
+
+
+def guardar_entrada_historial(usuario_id, entrada):
+    fila = _ejecutar(
+        """INSERT INTO historial
+           (usuario_id, tipo, resultado, fecha, texto, modelo_usado,
+            explicacion, respuesta_tarea, mensajes_extra)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        (
+            usuario_id, entrada.get("tipo"), entrada.get("resultado"),
+            entrada["fecha"].isoformat(), entrada.get("texto"),
+            entrada.get("modelo_usado"), entrada.get("explicacion"),
+            entrada.get("respuesta_tarea"),
+            json.dumps(entrada.get("mensajes_extra", [])),
+        ),
+        fetchone=True,
+    )
+    return fila[0]
+
+
+def actualizar_mensajes_historial(id_db, mensajes_extra):
+    _ejecutar(
+        "UPDATE historial SET mensajes_extra = %s WHERE id = %s",
+        (json.dumps(mensajes_extra), id_db),
+    )
+
+
+def cargar_historial_usuario(usuario_id):
+    filas = _ejecutar(
+        """SELECT id, tipo, resultado, fecha, texto, modelo_usado, explicacion,
+                  respuesta_tarea, mensajes_extra
+           FROM historial WHERE usuario_id = %s ORDER BY id""",
+        (usuario_id,), fetch=True,
+    )
+    resultado = []
+    for fila in filas or []:
+        (id_db, tipo, res, fecha, texto, modelo_usado, explicacion,
+         respuesta_tarea, mensajes_json) = fila
+        resultado.append({
+            "id_db": id_db, "tipo": tipo, "resultado": res,
+            "fecha": datetime.fromisoformat(fecha) if fecha else datetime.now(),
+            "texto": texto, "modelo_usado": modelo_usado,
+            "explicacion": explicacion, "respuesta_tarea": respuesta_tarea,
+            "mensajes_extra": json.loads(mensajes_json) if mensajes_json else [],
+        })
+    return resultado
+
+
+def obtener_uid_anonimo():
+    uid = st.query_params.get("uid")
+    if not uid:
+        uid = secrets.token_hex(8)
+        st.query_params["uid"] = uid
+    return uid
+
+
+def contar_uso_libre(uid):
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    fila = _ejecutar(
+        "SELECT conteo FROM uso_libre WHERE uid = %s AND fecha = %s",
+        (uid, hoy), fetchone=True,
+    )
+    return fila[0] if fila else 0
+
+
+def incrementar_uso_libre(uid):
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    _ejecutar(
+        """INSERT INTO uso_libre (uid, fecha, conteo) VALUES (%s, %s, 1)
+           ON CONFLICT (uid, fecha) DO UPDATE SET conteo = uso_libre.conteo + 1""",
+        (uid, hoy),
+    )
 
 
 def etiqueta_modelo(nombre_modelo: str) -> str:
@@ -196,6 +387,18 @@ def generar_respuesta_tarea(texto_usuario: str, tipo_tarea: str) -> str:
         return f"(Error al generar la respuesta: {error})"
 
 
+def guardar_en_historial(entrada):
+    """Agrega la entrada al historial de la sesion y, si hay sesion
+    iniciada, la persiste en la base de datos."""
+    st.session_state.historial.append(entrada)
+    usuario_activo = st.session_state.get("usuario")
+    if usuario_activo and DB_DISPONIBLE:
+        try:
+            entrada["id_db"] = guardar_entrada_historial(usuario_activo["id"], entrada)
+        except Exception as error:
+            st.caption(f"(No se pudo guardar en tu cuenta: {error})")
+
+
 def render_continuacion(entrada):
     """
     Muestra los mensajes de seguimiento de una tarea (activa o pasada) y
@@ -225,6 +428,13 @@ def render_continuacion(entrada):
 
         entrada["mensajes_extra"].append({"rol": "user", "contenido": nuevo_mensaje})
         entrada["mensajes_extra"].append({"rol": "assistant", "contenido": respuesta})
+
+        if st.session_state.get("usuario") and entrada.get("id_db"):
+            try:
+                actualizar_mensajes_historial(entrada["id_db"], entrada["mensajes_extra"])
+            except Exception:
+                pass
+
         st.rerun()
 
 
@@ -251,6 +461,8 @@ def iniciar_estado():
         st.session_state.rate_limits = None
     if "vista_historial" not in st.session_state:
         st.session_state.vista_historial = None
+    if "usuario" not in st.session_state:
+        st.session_state.usuario = None
 
 
 def probabilidad_de_preguntar(aciertos_consecutivos: int) -> float:
@@ -274,6 +486,7 @@ def revisar_inactividad(tipo_tarea: str):
 # ---------------------------------------------------------------------
 st.set_page_config(page_title="klArblIck", page_icon="🔎", layout="centered")
 iniciar_estado()
+inicializar_db()
 
 # Enter envia el textarea (hace click en "Enviar"); Cmd/Ctrl+Enter inserta
 # una linea nueva, como en la mayoria de apps de chat.
@@ -478,17 +691,37 @@ elif not st.session_state.tarea_activa:
         key="texto_tarea",
     )
 
-    seleccion_modelo = st.selectbox(
-        "Modelo",
-        ["Automatico (el sistema elige por ti)"] + OPCIONES_MODELO,
-        key="modelo_manual_select",
-    )
+    usuario_activo = st.session_state.usuario
+    opciones_modelo_paso1 = ["Automatico (el sistema elige por ti)"]
+    if usuario_activo:
+        opciones_modelo_paso1 += OPCIONES_MODELO
+    seleccion_modelo = st.selectbox("Modelo", opciones_modelo_paso1, key="modelo_manual_select")
     elegir_manual = seleccion_modelo != "Automatico (el sistema elige por ti)"
     modelo_elegido_manual = seleccion_modelo if elegir_manual else None
     if elegir_manual:
         st.caption(MODELOS_INFO[modelo_elegido_manual])
+    elif not usuario_activo:
+        st.caption("Inicia sesion para elegir el modelo tu mismo.")
 
-    if st.button("Enviar") and texto_usuario.strip():
+    uid_anonimo = None
+    usos_hoy = 0
+    limite_alcanzado = False
+    if not usuario_activo and DB_DISPONIBLE:
+        try:
+            uid_anonimo = obtener_uid_anonimo()
+            usos_hoy = contar_uso_libre(uid_anonimo)
+        except Exception:
+            usos_hoy = 0
+        limite_alcanzado = usos_hoy >= LIMITE_DIARIO_LIBRE
+        if limite_alcanzado:
+            st.warning(
+                f"Alcanzaste el limite del plan gratis ({LIMITE_DIARIO_LIBRE} tareas/dia). "
+                "Inicia sesion para seguir sin limite."
+            )
+        else:
+            st.caption(f"Plan gratis: {usos_hoy}/{LIMITE_DIARIO_LIBRE} tareas usadas hoy.")
+
+    if st.button("Enviar", disabled=limite_alcanzado) and texto_usuario.strip():
         with st.spinner("Identificando el tipo de tarea..."):
             tipo_detectado = clasificar_tarea(texto_usuario)
 
@@ -499,6 +732,12 @@ elif not st.session_state.tarea_activa:
                 "resumen, codigo, analisis de datos o generacion de imagenes)."
             )
         else:
+            if not usuario_activo and DB_DISPONIBLE and uid_anonimo:
+                try:
+                    incrementar_uso_libre(uid_anonimo)
+                except Exception:
+                    pass
+
             if elegir_manual:
                 st.session_state.tarea_activa = {
                     "texto": texto_usuario,
@@ -553,7 +792,7 @@ if st.session_state.tarea_activa:
             activa["modelo_usado"] = modelo_manual
             activa["resultado"] = "manual"
             activa["fecha"] = datetime.now()
-            st.session_state.historial.append(activa)
+            guardar_en_historial(activa)
 
         st.write(activa["explicacion"])
         st.markdown("**Respuesta a tu tarea:**")
@@ -576,7 +815,7 @@ if st.session_state.tarea_activa:
             activa["resultado"] = "directo"
             activa["fecha"] = datetime.now()
             st.session_state.progreso[tipo]["ultima_fecha"] = activa["fecha"]
-            st.session_state.historial.append(activa)
+            guardar_en_historial(activa)
 
         st.write(activa["explicacion"])
         st.markdown("**Respuesta a tu tarea:**")
@@ -620,7 +859,7 @@ if st.session_state.tarea_activa:
                 activa["modelo_elegido_usuario"] = respuesta
                 activa["acerto"] = acerto
                 activa["fecha"] = datetime.now()
-                st.session_state.historial.append(activa)
+                guardar_en_historial(activa)
                 st.rerun()
         else:
             if activa.get("acerto"):
@@ -634,6 +873,56 @@ if st.session_state.tarea_activa:
 
 # --- Historial visible: barra lateral ---
 with st.sidebar:
+    st.markdown("### Cuenta")
+    if not DB_DISPONIBLE:
+        st.caption("Sistema de cuentas no configurado todavia (plan gratis para todos).")
+    elif st.session_state.usuario:
+        st.success(f"👋 {st.session_state.usuario['email']}")
+        if st.button("Cerrar sesion", use_container_width=True):
+            st.session_state.usuario = None
+            st.session_state.historial = []
+            st.session_state.tarea_activa = None
+            st.session_state.vista_historial = None
+            st.rerun()
+    else:
+        st.caption(
+            f"Plan gratis: sin historial guardado, modelo automatico, "
+            f"{LIMITE_DIARIO_LIBRE} tareas/dia."
+        )
+        modo_auth = st.radio(
+            "Modo", ["Iniciar sesion", "Crear cuenta"],
+            horizontal=True, label_visibility="collapsed", key="modo_auth",
+        )
+        correo_auth = st.text_input("Correo", key="auth_correo")
+        contrasena_auth = st.text_input("Contraseña", type="password", key="auth_contrasena")
+
+        if modo_auth == "Iniciar sesion":
+            if st.button("Entrar", use_container_width=True):
+                try:
+                    usuario_encontrado = verificar_usuario(correo_auth, contrasena_auth)
+                except Exception as error:
+                    usuario_encontrado = None
+                    st.error(f"Error de conexion: {error}")
+                if usuario_encontrado:
+                    st.session_state.usuario = usuario_encontrado
+                    st.session_state.historial = cargar_historial_usuario(usuario_encontrado["id"])
+                    st.session_state.tarea_activa = None
+                    st.session_state.vista_historial = None
+                    st.rerun()
+                elif correo_auth:
+                    st.error("Correo o contraseña incorrectos.")
+        else:
+            if st.button("Crear cuenta", use_container_width=True):
+                try:
+                    ok, mensaje = crear_usuario(correo_auth, contrasena_auth)
+                except Exception as error:
+                    ok, mensaje = False, f"Error de conexion: {error}"
+                if ok:
+                    st.success(mensaje)
+                else:
+                    st.error(mensaje)
+
+    st.divider()
     st.markdown("### Historial")
     if st.session_state.tarea_activa or st.session_state.vista_historial:
         if st.button("+ Nueva tarea", use_container_width=True):
